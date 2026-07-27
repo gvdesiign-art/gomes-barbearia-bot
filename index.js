@@ -109,7 +109,10 @@ async function connectWhatsApp() {
           console.log('[WhatsApp] Reconectando em 5 segundos...');
           setTimeout(connectWhatsApp, 5000);
         } else {
-          console.log('[WhatsApp] ⚠️ Deslogado! Exclua /data/auth_state e escaneie o QR novamente via /qr');
+          // Deslogado pelo WhatsApp — limpa sessão e gera novo QR automaticamente
+          console.log('[WhatsApp] Deslogado pelo WhatsApp. Limpando sessão e gerando novo QR em /qr...');
+          try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+          setTimeout(connectWhatsApp, 3000);
         }
       } else if (connection === 'open') {
         isConnected = true;
@@ -363,6 +366,17 @@ app.get('/qr', async (req, res) => {
 });
 
 // ── Rota: status do WhatsApp ──────────────────────────────────
+// POST /reset-whatsapp — força limpeza de sessão e novo QR
+app.post('/reset-whatsapp', async (req, res) => {
+  console.log('[WhatsApp] Reset manual solicitado via /reset-whatsapp');
+  isConnected = false;
+  currentQR = null;
+  if (sock) { try { sock.end(); } catch (e) {} sock = null; }
+  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (e) {}
+  setTimeout(connectWhatsApp, 1000);
+  res.json({ success: true, message: 'Sessão limpa. Acesse /qr em 5 segundos para escanear.' });
+});
+
 app.get('/whatsapp-status', (req, res) => {
   res.json({
     connected: isConnected,
