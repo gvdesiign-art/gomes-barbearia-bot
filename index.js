@@ -137,26 +137,35 @@ async function sendMsg(phone, message) {
   }
 
   const p1 = fmtPhone(phone);
-  const jid1 = p1 + '@s.whatsapp.net';
+  const p2 = (p1.length === 13 && p1.startsWith('55') && p1[4] === '9')
+    ? '55' + p1.substring(2, 4) + p1.substring(5)
+    : null;
 
+  // Verifica qual formato do número existe no WhatsApp
+  let jid = p1 + '@s.whatsapp.net';
   try {
-    await sock.sendMessage(jid1, { text: message });
-    console.log(`[WhatsApp] ✅ Enviado para ${p1}`);
+    const [res1] = await sock.onWhatsApp(p1) || [];
+    if (res1?.exists) {
+      jid = res1.jid;
+      console.log(`[WhatsApp] Número verificado: ${jid}`);
+    } else if (p2) {
+      const [res2] = await sock.onWhatsApp(p2) || [];
+      if (res2?.exists) {
+        jid = res2.jid;
+        console.log(`[WhatsApp] Número verificado (formato antigo): ${jid}`);
+      } else {
+        console.warn(`[WhatsApp] ⚠️ Número ${p1} não encontrado no WhatsApp — tentando enviar mesmo assim`);
+      }
+    }
   } catch (e) {
-    console.error(`[WhatsApp] Erro ao enviar para ${p1}:`, e.message);
+    console.warn(`[WhatsApp] Não foi possível verificar número ${p1}, enviando direto:`, e.message);
   }
 
-  // Para números BR com 9 extra (13 dígitos), tenta também sem o 9
-  // pois contas antigas ficaram registradas no formato de 8 dígitos
-  if (p1.length === 13 && p1.startsWith('55') && p1[4] === '9') {
-    const p2 = '55' + p1.substring(2, 4) + p1.substring(5);
-    const jid2 = p2 + '@s.whatsapp.net';
-    try {
-      await sock.sendMessage(jid2, { text: message });
-      console.log(`[WhatsApp] ✅ Enviado também para ${p2} (formato antigo)`);
-    } catch (e) {
-      // Ignorar erro no formato alternativo
-    }
+  try {
+    await sock.sendMessage(jid, { text: message });
+    console.log(`[WhatsApp] ✅ Enviado para ${jid}`);
+  } catch (e) {
+    console.error(`[WhatsApp] ❌ Erro ao enviar para ${jid}:`, e.message);
   }
 }
 
