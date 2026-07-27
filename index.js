@@ -12,18 +12,30 @@ app.use(express.json());
 // ── Credenciais Z-API ──────────────────────────────────────────
 const INSTANCE_ID = process.env.ZAPI_INSTANCE_ID || '3F69591CB7BA626697BA46186AAB5C98';
 const TOKEN       = process.env.ZAPI_TOKEN       || '2DDDB2453A59055BC4B7C12F';
-const BARBEIRO    = process.env.BARBEIRO_PHONE   || '5521998086350';
+const BARBEIRO    = process.env.BARBEIRO_PHONE   || '5521998086350'; // número do barbeiro
 
 // ── Arquivo de agendamentos para persistência ──────────────────
 // Usa /data se um Railway Volume estiver montado lá; caso contrário usa o diretório da app
 const DATA_DIR = fs.existsSync('/data') ? '/data' : __dirname;
 const DB_FILE = path.join(DATA_DIR, 'bookings.json');
+const BLOCKED_FILE = path.join(DATA_DIR, 'blocked.json');
 console.log(`[DB] Usando arquivo: ${DB_FILE}`);
 function loadBookings() {
   try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { return []; }
 }
 function saveBookings(list) {
   fs.writeFileSync(DB_FILE, JSON.stringify(list, null, 2));
+}
+function loadBlocked() {
+  try { return JSON.parse(fs.readFileSync(BLOCKED_FILE, 'utf8')); } catch { return {}; }
+}
+function saveBlocked(data) {
+  fs.writeFileSync(BLOCKED_FILE, JSON.stringify(data, null, 2));
+}
+const MONTHS_PT = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+function isoToLabel(iso) {
+  const [y, m, d] = iso.split('-');
+  return `${parseInt(d)} de ${MONTHS_PT[parseInt(m)-1]} de ${y}`;
 }
 
 // ── Utilitários ────────────────────────────────────────────────
@@ -38,6 +50,9 @@ const MONTHS = {
   julho:6,agosto:7,setembro:8,outubro:9,novembro:10,dezembro:11
 };
 function parseDate(dateStr, timeStr) {
+  // dateStr: "27 de Julho de 2026"  |  timeStr: "11:00"
+  const parts = dateStr.toLowerCase().replace(' de ', '|').split('|');
+  // parts: ["27", "julho", "2026"]  (splitting "27 de julho de 2026")
   const tokens = dateStr.toLowerCase().split(/\s+de\s+/);
   const day   = parseInt(tokens[0]);
   const month = MONTHS[tokens[1]?.trim()] ?? 0;
@@ -65,6 +80,8 @@ async function sendMsg(phone, message) {
   const p1 = fmtPhone(phone);
   await send(p1);
 
+  // Para números BR com 9 extra (13 dígitos), tenta também sem o 9
+  // pois contas antigas ficaram registradas no formato de 8 dígitos
   if (p1.length === 13 && p1.startsWith('55') && p1[4] === '9') {
     const p2 = '55' + p1.substring(2, 4) + p1.substring(5);
     await send(p2);
@@ -155,39 +172,53 @@ cron.schedule('* * * * *', async () => {
   for (const b of list) {
     if (b.done) continue;
     const appt = parseDate(b.date, b.time);
-    const diffMin = (appt - now) / 60000;
+    const diffMin = (appt - now) / 60000; // minutos restantes
 
+    // Lembrete na véspera: entre 23h e 24h antes
     if (!b.sent24h && diffMin >= 23 * 60 && diffMin <= 24 * 60) {
       await sendMsg(b.phone, msgLembreteVespera(b));
-      b.sent24h = true; changed = true;
+      b.sent24h = true;
+      changed = true;
       console.log(`[Lembrete 24h] enviado para ${b.name}`);
     }
 
+    // Lembrete 1h antes (cobre agendamentos de última hora)
     if (!b.sent1h && diffMin >= 55 && diffMin <= 65) {
       await sendMsg(b.phone, msgLembrete1h(b));
-      b.sent1h = true; changed = true;
+      b.sent1h = true;
+      changed = true;
       console.log(`[Lembrete 1h] enviado para ${b.name}`);
     }
 
+    // Lembrete 10 minutos antes
     if (!b.sent10min && diffMin >= 8 && diffMin <= 12) {
       await sendMsg(b.phone, msgLembrete10min(b));
-      b.sent10min = true; changed = true;
+      b.sent10min = true;
+      changed = true;
       console.log(`[Lembrete 10min] enviado para ${b.name}`);
     }
 
+    // Detectar falta: passou 30min sem confirmação de presença
     if (!b.faltouNotif && !b.compareceu && diffMin < -30 && diffMin > -60) {
       await sendMsg(BARBEIRO, msgClienteFaltou(b));
-      b.faltouNotif = true; changed = true;
+      b.faltouNotif = true;
+      changed = true;
       console.log(`[Faltou] notificado barbeiro sobre ${b.name}`);
     }
 
+    // Avaliação pós-corte: ~2h após o horário
     if (!b.sentAvaliacao && diffMin < -110 && diffMin > -130) {
       await sendMsg(b.phone, msgAvaliacao(b));
-      b.sentAvaliacao = true; changed = true;
+      b.sentAvaliacao = true;
+      changed = true;
       console.log(`[Avaliação] enviada para ${b.name}`);
     }
 
-    if (diffMin < -180) { b.done = true; changed = true; }
+    // Marcar como concluído após 3h do corte
+    if (diffMin < -180) {
+      b.done = true;
+      changed = true;
+    }
   }
 
   if (changed) saveBookings(list);
@@ -204,33 +235,107 @@ app.post('/booking', async (req, res) => {
   const booking = {
     id: Date.now(),
     name, phone, service, date, time, price, duration, email, age, obs,
-    sent24h: false, sent1h: false, sent10min: false, done: false,
+    sent24h: false, sent10min: false, done: false,
     createdAt: new Date().toISOString()
   };
 
+  // Salvar agendamento
   const list = loadBookings();
   list.push(booking);
   saveBookings(list);
 
+  // Enviar confirmação para o cliente
   await sendMsg(phone, msgConfirmacao(booking));
+
+  // Notificar barbeiro
   await sendMsg(BARBEIRO, msgNovoBarbeiro(booking));
 
   console.log(`[Agendamento] ${name} - ${service} - ${date} ${time}`);
   res.json({ success: true, message: 'Agendamento confirmado e WhatsApp enviado!' });
 });
 
-// ── Rota: listar agendamentos ──────────────────────────────────
+// ── Rota: listar agendamentos (debug) ─────────────────────────
 app.get('/bookings', (req, res) => {
   res.json(loadBookings());
 });
 
-// ── Rota: cancelar agendamento (barbeiro cancela) ──────────────
+// ── Rotas: horários bloqueados ─────────────────────────────────
+// GET /blocks?date=YYYY-MM-DD  → retorna array de slots bloqueados no dia
+app.get('/blocks', (req, res) => {
+  const { date } = req.query;
+  const blocked = loadBlocked();
+  res.json(date ? (blocked[date] || []) : blocked);
+});
+
+// POST /blocks  { date: 'YYYY-MM-DD', slot: 'HH:MM' }
+app.post('/blocks', (req, res) => {
+  const { date, slot } = req.body;
+  if (!date || !slot) return res.status(400).json({ error: 'date e slot obrigatórios' });
+  const blocked = loadBlocked();
+  if (!blocked[date]) blocked[date] = [];
+  if (!blocked[date].includes(slot)) blocked[date].push(slot);
+  saveBlocked(blocked);
+  console.log(`[Block] ${date} ${slot} bloqueado`);
+  res.json({ success: true });
+});
+
+// DELETE /blocks  { date: 'YYYY-MM-DD', slot: 'HH:MM' }
+app.delete('/blocks', (req, res) => {
+  const { date, slot } = req.body;
+  if (!date || !slot) return res.status(400).json({ error: 'date e slot obrigatórios' });
+  const blocked = loadBlocked();
+  if (blocked[date]) {
+    blocked[date] = blocked[date].filter(s => s !== slot);
+    if (!blocked[date].length) delete blocked[date];
+    saveBlocked(blocked);
+  }
+  console.log(`[Block] ${date} ${slot} desbloqueado`);
+  res.json({ success: true });
+});
+
+// GET /available?date=YYYY-MM-DD  → { date, booked: [...], blocked: [...] }
+app.get('/available', (req, res) => {
+  const { date } = req.query;
+  if (!date) return res.status(400).json({ error: 'date obrigatório (YYYY-MM-DD)' });
+  const list = loadBookings();
+  const blocked = loadBlocked();
+  const localDate = isoToLabel(date);
+  const dayBookings = list.filter(b => b.date === localDate && !b.done);
+  const bookedSlots = dayBookings.map(b => b.time);
+  res.json({ date, booked: bookedSlots, blocked: blocked[date] || [] });
+});
+
+// DELETE /booking/by-slot  { date: 'YYYY-MM-DD', slot: 'HH:MM' }  — cancela + WhatsApp
+app.delete('/booking/by-slot', async (req, res) => {
+  const { date, slot } = req.body;
+  if (!date || !slot) return res.status(400).json({ error: 'date e slot obrigatórios' });
+  const localDate = isoToLabel(date);
+  const list = loadBookings();
+  const booking = list.find(b => b.date === localDate && b.time === slot && !b.done);
+  if (!booking) {
+    return res.json({ success: true, message: 'Nenhum agendamento no bot para esse slot.' });
+  }
+  const msg =
+    `😔 *Agendamento cancelado*\n\n` +
+    `Olá, *${booking.name}*! Infelizmente precisamos cancelar seu agendamento.\n\n` +
+    `✂️ *Serviço:* ${booking.service}\n` +
+    `📅 *Data:* ${booking.date}\n` +
+    `⏰ *Horário:* ${booking.time}\n\n` +
+    `Entre em contato pelo WhatsApp para reagendar. Pedimos desculpas pelo inconveniente! 🙏`;
+  await sendMsg(booking.phone, msg);
+  saveBookings(list.filter(b => b !== booking));
+  console.log(`[Cancel by-slot] ${booking.name} ${booking.date} ${booking.time}`);
+  res.json({ success: true, message: `${booking.name} cancelado e notificado.` });
+});
+
+// ── Rota: cancelar agendamento individual (barbeiro cancela) ──
 app.delete('/booking/:id', async (req, res) => {
   const id = Number(req.params.id);
   const list = loadBookings();
   const booking = list.find(b => b.id === id);
   if (!booking) return res.status(404).json({ error: 'Agendamento não encontrado' });
 
+  // Notificar o cliente
   const msg =
     `😔 *Agendamento cancelado*\n\n` +
     `Olá, *${booking.name}*! Infelizmente precisamos cancelar seu agendamento.\n\n` +
@@ -240,6 +345,7 @@ app.delete('/booking/:id', async (req, res) => {
     `Entre em contato pelo WhatsApp para reagendar. Pedimos desculpas pelo inconveniente! 🙏`;
   await sendMsg(booking.phone, msg);
 
+  // Remover da lista
   const updated = list.filter(b => b.id !== id);
   saveBookings(updated);
   res.json({ success: true, message: `Agendamento de ${booking.name} cancelado e cliente notificado.` });
