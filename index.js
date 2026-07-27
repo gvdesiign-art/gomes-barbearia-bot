@@ -50,6 +50,18 @@ function fmtPhone(phone) {
   return p;
 }
 
+// Compara número do JID do WhatsApp com número salvo no agendamento
+// Lida com formato antigo (12 dígitos) vs novo (13 dígitos, com 9 extra)
+function phonesMatch(jidPhone, storedPhone) {
+  const clean = p => p.replace(/\D/g, '').replace(/^55/, '');
+  const d1 = clean(jidPhone);
+  const d2 = clean(storedPhone);
+  if (d1 === d2) return true;
+  if (d1.length === 11 && d2.length === 10) return d1.substring(0, 2) + d1.substring(3) === d2;
+  if (d2.length === 11 && d1.length === 10) return d2.substring(0, 2) + d2.substring(3) === d1;
+  return false;
+}
+
 const MONTHS = {
   janeiro:0,fevereiro:1,'março':2,abril:3,maio:4,junho:5,
   julho:6,agosto:7,setembro:8,outubro:9,novembro:10,dezembro:11
@@ -88,6 +100,31 @@ async function connectWhatsApp() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // ── Responder quando cliente envia mensagem iniciando conversa ──
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+        const from = msg.key.remoteJid;
+        if (!from || from.endsWith('@g.us')) continue; // ignora grupos
+
+        const senderJid = from.replace('@s.whatsapp.net', '');
+        const list = loadBookings();
+
+        // Busca agendamento mais recente não confirmado deste número
+        const booking = [...list]
+          .reverse()
+          .find(b => !b.done && !b.confirmationReplied && phonesMatch(senderJid, b.phone));
+
+        if (booking) {
+          booking.confirmationReplied = true;
+          saveBookings(list);
+          await sendMsg(booking.phone, msgConfirmacao(booking));
+          console.log(`[Confirmação] Enviada para ${booking.name} (${booking.phone}) após contato do cliente`);
+        }
+      }
+    });
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -406,6 +443,7 @@ app.post('/booking', async (req, res) => {
     id: Date.now(),
     name, phone, service, date, time, price, duration, email, age, obs,
     sent24h: false, sent1h: false, sent10min: false, done: false,
+    confirmationReplied: false,
     createdAt: new Date().toISOString()
   };
 
@@ -413,7 +451,8 @@ app.post('/booking', async (req, res) => {
   list.push(booking);
   saveBookings(list);
 
-  await sendMsg(phone, msgConfirmacao(booking));
+  // Não envia proativamente para o cliente — ele inicia a conversa pelo botão no site
+  // e o bot responde via messages.upsert listener (garante entrega na caixa de entrada)
   await sendMsg(BARBEIRO, msgNovoBarbeiro(booking));
 
   console.log(`[Agendamento] ${name} - ${service} - ${date} ${time}`);
